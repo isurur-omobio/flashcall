@@ -1,0 +1,358 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Primary Database
+  postgres:
+    build:
+      context: .
+      dockerfile: ./deployment/docker/infrastructure/postgres/Dockerfile
+    container_name: voice-fw-postgres
+    environment:
+      TZ: ${TZ:-Asia/Kolkata}
+      POSTGRES_DB: ${POSTGRES_DB:-voice_fw_db}
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-VoiceFW2024!}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - postgres_logs:/var/log/postgresql
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 90s
+    networks:
+      - voice-fw-network
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:7.2.1-alpine
+    container_name: voice-fw-redis
+    environment:
+      TZ: ${TZ:-Asia/Kolkata}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - voice-fw-network
+    restart: unless-stopped
+
+  # Spark Master
+  spark-master:
+    build:
+      context: .
+      dockerfile: ./deployment/docker/etl/spark/Dockerfile
+      args:
+        - SPARK_VERSION=${SPARK_VERSION:-3.5.6}
+        - HADOOP_VERSION=${HADOOP_VERSION:-3}
+        - SCALA_VERSION=${SCALA_VERSION:-2.12}
+    container_name: voice-fw-spark-master
+    environment:
+      - TZ=${TZ:-Asia/Kolkata}
+      - SPARK_MODE=${SPARK_MODE_MASTER:-master}
+      - SPARK_MASTER_HOST=${SPARK_MASTER_HOST:-spark-master}
+      - SPARK_MASTER_PORT=${SPARK_MASTER_PORT:-7077}
+      - SPARK_MASTER_WEBUI_PORT=${SPARK_MASTER_UI_PORT:-8080}
+      - SPARK_DRIVER_MEMORY=${SPARK_DRIVER_MEMORY:-2g}
+      - SPARK_DRIVER_CORES=${SPARK_DRIVER_CORES:-2}
+      - SPARK_DRIVER_MAX_RESULT_SIZE=${SPARK_DRIVER_MAX_RESULT_SIZE:-2g}
+      - SPARK_CONF_DIR=${SPARK_CONF_DIR:-/opt/spark/conf}
+      - SPARK_LOG_LEVEL=${SPARK_LOG_LEVEL:-INFO}
+      - JAVA_HOME=/usr/local/openjdk-11
+    volumes:
+      - ./app/etl/spark:/app/spark-jobs:ro
+      - ./data:/app/data
+      - ./configs:/app/configs:ro
+    ports:
+      - "${SPARK_MASTER_PORT:-7077}:${SPARK_MASTER_PORT:-7077}"
+      - "${SPARK_MASTER_UI_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - voice-fw-network
+    restart: unless-stopped
+
+#TIN eke wadey iwara karapiya
+
+  # Spark Worker
+  spark-worker:
+    build:
+      context: .
+      dockerfile: ./deployment/docker/etl/spark/Dockerfile
+      args:
+        - SPARK_VERSION=${SPARK_VERSION:-3.5.6}
+        - HADOOP_VERSION=${HADOOP_VERSION:-3}
+        - SCALA_VERSION=${SCALA_VERSION:-2.12}
+    environment:
+      - TZ=${TZ:-Asia/Kolkata}
+      - SPARK_MODE=${SPARK_MODE_WORKER:-worker}
+      - SPARK_MASTER_URL=spark://spark-master:${SPARK_MASTER_PORT:-7077}
+      - SPARK_MASTER_HOST=${SPARK_MASTER_HOST:-spark-master}
+      - SPARK_WORKER_CORES=${SPARK_WORKER_CORES:-2}
+      - SPARK_WORKER_MEMORY=${SPARK_WORKER_MEMORY:-2g}
+      - SPARK_EXECUTOR_MEMORY=${SPARK_EXECUTOR_MEMORY:-1g}
+      - SPARK_WORKER_WEBUI_PORT=${SPARK_WORKER_UI_PORT:-8081}
+      - SPARK_WORKER_OPTS=-Dspark.worker.cleanup.enabled=${SPARK_WORKER_CLEANUP_ENABLED:-true} -Dspark.worker.cleanup.interval=${SPARK_WORKER_CLEANUP_INTERVAL:-1800}
+      - JAVA_HOME=/usr/local/openjdk-11
+    volumes:
+      - ./app/etl/spark:/app/spark-jobs:ro
+      - ./data:/app/data
+      - ./configs:/app/configs:ro
+    depends_on:
+      - spark-master
+    networks:
+      - voice-fw-network
+    restart: unless-stopped
+    deploy:
+      replicas: ${SPARK_WORKER_REPLICAS:-2}
+
+  # Airflow Database
+  airflow-postgres:
+    image: postgres:15.4-alpine
+    container_name: voice-fw-airflow-postgres
+    environment:
+      TZ: ${TZ:-Asia/Kolkata}
+      POSTGRES_USER: ${AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow123}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME:-airflow}
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 5
+    networks:
+      - voice-fw-network
+    restart: unless-stopped
+
+  # Airflow Init
+  airflow-init:
+    build:
+      context: .
+      dockerfile: ./deployment/docker/etl/airflow/Dockerfile
+    environment:
+      - TZ=${TZ:-Asia/Kolkata}
+      - AIRFLOW__CORE__EXECUTOR=${AIRFLOW_EXECUTOR:-CeleryExecutor}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow123@airflow-postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:${REDIS_PORT:-6379}/${REDIS_CELERY_DB:-1}
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow123@airflow-postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY:-ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW_SECRET_KEY:-a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED=${AIRFLOW_DB_POOL_ENABLED:-True}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE=${AIRFLOW_DB_POOL_SIZE:-5}
+      - AIRFLOW__DATABASE__MAX_DB_RETRIES=${AIRFLOW_DB_MAX_RETRIES:-3}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW_SECRET_KEY:-a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED=${AIRFLOW_DB_POOL_ENABLED:-True}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE=${AIRFLOW_DB_POOL_SIZE:-5}
+      - AIRFLOW__DATABASE__MAX_DB_RETRIES=${AIRFLOW_DB_MAX_RETRIES:-3}
+      - _AIRFLOW_DB_UPGRADE=${AIRFLOW_DB_UPGRADE:-true}
+      - _AIRFLOW_WWW_USER_CREATE=${AIRFLOW_WWW_USER_CREATE:-true}
+      - _AIRFLOW_WWW_USER_USERNAME=${AIRFLOW_ADMIN_USERNAME:-admin}
+      - _AIRFLOW_WWW_USER_PASSWORD=${AIRFLOW_ADMIN_PASSWORD:-admin123}
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+      - SPARK_HOME=/opt/spark
+      - PATH=/opt/spark/bin:/opt/spark/sbin:${PATH}
+    volumes:
+      - ./app/etl/airflow/dags:/opt/airflow/dags:ro
+      - ./configs:/app/configs:ro
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - voice-fw-network
+    command: ["airflow", "db", "upgrade"]
+
+  # Airflow Webserver
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: ./deployment/docker/etl/airflow/Dockerfile
+    container_name: voice-fw-airflow-webserver
+    environment:
+      - TZ=${TZ:-Asia/Kolkata}
+      - AIRFLOW__CORE__EXECUTOR=${AIRFLOW_EXECUTOR:-CeleryExecutor}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow123@airflow-postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:${REDIS_PORT:-6379}/${REDIS_CELERY_DB:-1}
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow123@airflow-postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY:-ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW_SECRET_KEY:-a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED=${AIRFLOW_DB_POOL_ENABLED:-True}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE=${AIRFLOW_DB_POOL_SIZE:-5}
+      - AIRFLOW__DATABASE__MAX_DB_RETRIES=${AIRFLOW_DB_MAX_RETRIES:-3}
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    volumes:
+      - ./app/etl/airflow/dags:/opt/airflow/dags:ro
+      - ./data:/app/data
+      - ./configs:/app/configs:ro
+    ports:
+      - "${AIRFLOW_PORT:-8081}:8080"
+    command: webserver
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - voice-fw-network
+    restart: unless-stopped
+
+  # Airflow Scheduler
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: ./deployment/docker/etl/airflow/Dockerfile
+    environment:
+      - TZ=${TZ:-Asia/Kolkata}
+      - AIRFLOW__CORE__EXECUTOR=${AIRFLOW_EXECUTOR:-CeleryExecutor}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow123@airflow-postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:${REDIS_PORT:-6379}/${REDIS_CELERY_DB:-1}
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow123@airflow-postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY:-ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW_SECRET_KEY:-a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED=${AIRFLOW_DB_POOL_ENABLED:-True}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE=${AIRFLOW_DB_POOL_SIZE:-5}
+      - AIRFLOW__DATABASE__MAX_DB_RETRIES=${AIRFLOW_DB_MAX_RETRIES:-3}
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    volumes:
+      - ./app/etl/airflow/dags:/opt/airflow/dags:ro
+      - ./data:/app/data
+      - ./configs:/app/configs:ro
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - voice-fw-network
+    restart: unless-stopped
+
+  # Airflow Worker
+  airflow-worker:
+    build:
+      context: .
+      dockerfile: ./deployment/docker/etl/airflow/Dockerfile
+
+    environment:
+      - TZ=${TZ:-Asia/Kolkata}
+      - AIRFLOW__CORE__EXECUTOR=${AIRFLOW_EXECUTOR:-CeleryExecutor}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow123@airflow-postgres:5432/airflow
+      - AIRFLOW__CELERY__BROKER_URL=redis://redis:${REDIS_PORT:-6379}/${REDIS_CELERY_DB:-1}
+      - AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:airflow123@airflow-postgres:5432/airflow
+      - AIRFLOW__CORE__FERNET_KEY=${AIRFLOW_FERNET_KEY:-ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg=}
+      - AIRFLOW__WEBSERVER__SECRET_KEY=${AIRFLOW_SECRET_KEY:-a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_ENABLED=${AIRFLOW_DB_POOL_ENABLED:-True}
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_POOL_SIZE=${AIRFLOW_DB_POOL_SIZE:-5}
+      - AIRFLOW__DATABASE__MAX_DB_RETRIES=${AIRFLOW_DB_MAX_RETRIES:-3}
+      - JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    volumes:
+      - ./app/etl/airflow/dags:/opt/airflow/dags:ro
+      - ./data:/app/data
+      - ./configs:/app/configs:ro
+    command: ["worker"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - voice-fw-network
+    restart: unless-stopped
+    deploy:
+      replicas: ${AIRFLOW_WORKER_REPLICAS:-2}
+
+# Commented Services for Future Development
+  # # FastAPI Application
+  # api:
+  #   build:
+  #     context: .
+  #     dockerfile: ./deployment/docker/api/Dockerfile
+  #   environment:
+  #     - DATABASE_URL=postgresql://admin:VoiceFW2024!@postgres:5432/voice_fw_db
+  #     - REDIS_URL=redis://redis:6379/0
+  #   volumes:
+  #     - ./data/models:/app/models
+  #     - ./configs:/app/configs:ro
+  #   ports:
+  #     - "8000:8000"
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   networks:
+  #     - voice-fw-network
+
+  # # ML Workers
+  # ml-worker:
+  #   build:
+  #     context: .
+  #     dockerfile: ./deployment/docker/ml/Dockerfile
+  #   environment:
+  #     - CELERY_BROKER_URL=redis://redis:6379/2
+  #   volumes:
+  #     - ./data/models:/app/models
+  #   command: celery worker
+  #   networks:
+  #     - voice-fw-network
+
+  # # Streamlit Dashboard
+  # dashboard:
+  #   build:
+  #     context: .
+  #     dockerfile: ./deployment/docker/dashboard/Dockerfile
+  #   ports:
+  #     - "8501:8501"
+  #   networks:
+  #     - voice-fw-network
+
+  # # ELK Stack
+  # elasticsearch:
+  #   image: elasticsearch:8.10.4
+  #   environment:
+  #     - discovery.type=single-node
+  #   volumes:
+  #     - elasticsearch_data:/usr/share/elasticsearch/data
+  #   ports:
+  #     - "9200:9200"
+  #   networks:
+  #     - voice-fw-network
+
+  # logstash:
+  #   image: logstash:8.10.4
+  #   volumes:
+  #     - ./deployment/monitoring/logstash/logstash.conf:/usr/share/logstash/pipeline/logstash.conf:ro
+  #   ports:
+  #     - "5044:5044"
+  #   networks:
+  #     - voice-fw-network
+
+  # kibana:
+  #   image: kibana:8.10.4
+  #   environment:
+  #     - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+  #   ports:
+  #     - "5601:5601"
+  #   networks:
+  #     - voice-fw-network
+
+volumes:
+  postgres_data:
+  postgres_logs:
+  airflow_postgres_data:
+  redis_data:
+  # elasticsearch_data:
+
+networks:
+  voice-fw-network:
+    driver: bridge
